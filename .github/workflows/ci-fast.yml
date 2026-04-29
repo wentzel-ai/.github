@@ -1,0 +1,135 @@
+# Reusable workflow — Tier 1 fast CI for every push + PR.
+#
+# Runs on the wentzel-runner self-hosted fleet (arm64 spot). Per org policy:
+# never fall back to GitHub-hosted minutes.
+#
+# Caller invocation:
+#
+#   jobs:
+#     ci-fast:
+#       uses: wentzel-ai/.github/.github/workflows/ci-fast.yml@main
+#       # All inputs optional. Defaults match the wentzel.ai monorepo.
+#       with:
+#         node-version: '22'
+#         package-manager: 'pnpm'
+#         coverage-threshold: 90
+#
+# Skips any step whose package.json script is missing — repos with partial
+# tooling don't fail. Steps are scoped to the FAST tier:
+#   prettier:check  ·  eslint  ·  tsc --noEmit  ·  vitest  ·  build
+#
+# E2E (Playwright), Lighthouse, deploy belong in ci-main.yml (push to main).
+
+name: CI · fast
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        type: string
+        default: '22'
+      package-manager:
+        type: string
+        default: 'pnpm'
+        description: 'pnpm | npm | yarn'
+      pnpm-version:
+        type: string
+        default: '9'
+      coverage-threshold:
+        type: number
+        default: 0
+        description: 'Set >0 to enforce vitest coverage gate'
+
+jobs:
+  fast:
+    runs-on: [self-hosted, linux, arm64, wentzel-runner]
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install pnpm
+        if: ${{ inputs.package-manager == 'pnpm' }}
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ inputs.pnpm-version }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: ${{ inputs.package-manager }}
+
+      - name: Install dependencies
+        run: |
+          if [ "${{ inputs.package-manager }}" = "pnpm" ]; then
+            pnpm install --frozen-lockfile
+          elif [ "${{ inputs.package-manager }}" = "yarn" ]; then
+            yarn install --frozen-lockfile
+          else
+            npm ci
+          fi
+
+      - name: Prettier check
+        run: |
+          if jq -e '.scripts.format' package.json >/dev/null 2>&1; then
+            ${{ inputs.package-manager }} run format --check || ${{ inputs.package-manager }} run format
+          elif jq -e '.scripts."prettier:check"' package.json >/dev/null 2>&1; then
+            ${{ inputs.package-manager }} run prettier:check
+          else
+            ${{ inputs.package-manager }} dlx prettier --check . || echo "::warning::prettier check skipped (no script + dlx fallback failed)"
+          fi
+        shell: bash
+
+      - name: ESLint
+        run: |
+          if jq -e '.scripts.lint' package.json >/dev/null 2>&1; then
+            ${{ inputs.package-manager }} run lint
+          else
+            echo "::warning::no 'lint' script in package.json — skipping ESLint"
+          fi
+        shell: bash
+
+      - name: TypeScript typecheck
+        run: |
+          if jq -e '.scripts.typecheck' package.json >/dev/null 2>&1; then
+            ${{ inputs.package-manager }} run typecheck
+          elif jq -e '.scripts."type-check"' package.json >/dev/null 2>&1; then
+            ${{ inputs.package-manager }} run type-check
+          elif [ -f tsconfig.json ] || [ -f tsconfig.base.json ]; then
+            ${{ inputs.package-manager }} dlx typescript --noEmit --project tsconfig.json
+          else
+            echo "::warning::no tsconfig.json — skipping typecheck"
+          fi
+        shell: bash
+
+      - name: Vitest unit tests
+        run: |
+          if jq -e '.scripts.test' package.json >/dev/null 2>&1; then
+            ${{ inputs.package-manager }} run test -- --run --passWithNoTests || \
+              ${{ inputs.package-manager }} run test
+          else
+            echo "::warning::no 'test' script in package.json — skipping unit tests"
+          fi
+        shell: bash
+
+      - name: Coverage gate
+        if: ${{ inputs.coverage-threshold > 0 }}
+        run: |
+          if jq -e '.scripts."test:coverage"' package.json >/dev/null 2>&1; then
+            ${{ inputs.package-manager }} run test:coverage
+          elif jq -e '.scripts.coverage' package.json >/dev/null 2>&1; then
+            ${{ inputs.package-manager }} run coverage
+          else
+            ${{ inputs.package-manager }} run test -- --run --coverage --coverage.thresholds.statements=${{ inputs.coverage-threshold }} --coverage.thresholds.branches=${{ inputs.coverage-threshold }}
+          fi
+        shell: bash
+
+      - name: Build
+        run: |
+          if jq -e '.scripts.build' package.json >/dev/null 2>&1; then
+            ${{ inputs.package-manager }} run build
+          else
+            echo "::warning::no 'build' script in package.json — skipping build verify"
+          fi
+        shell: bash

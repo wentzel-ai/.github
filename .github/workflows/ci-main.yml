@@ -1,0 +1,155 @@
+# Reusable workflow — Tier 3 full CI for push to main.
+#
+# Runs E2E (Playwright) + Lighthouse + production-build verification on the
+# wentzel-runner self-hosted fleet. Slower tier (~10-30 min); intentionally
+# scoped to push-to-main events to keep PR feedback under 3 min.
+#
+# Caller invocation:
+#
+#   jobs:
+#     ci-main:
+#       uses: wentzel-ai/.github/.github/workflows/ci-main.yml@main
+#       with:
+#         node-version: '22'
+#         package-manager: 'pnpm'
+#         playwright-script: 'test:e2e'
+#         lighthouse-script: 'lighthouse'
+#
+# Each step is gated on the corresponding package.json script existing —
+# repos without Playwright or Lighthouse skip silently. Add the scripts to
+# package.json to opt in.
+
+name: CI · main
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        type: string
+        default: '22'
+      package-manager:
+        type: string
+        default: 'pnpm'
+      pnpm-version:
+        type: string
+        default: '9'
+      playwright-script:
+        type: string
+        default: 'test:e2e'
+      lighthouse-script:
+        type: string
+        default: 'lighthouse'
+      run-deploy:
+        type: boolean
+        default: false
+        description: 'Set true if package.json has a "deploy" script the workflow should invoke'
+
+jobs:
+  e2e:
+    runs-on: [self-hosted, linux, arm64, wentzel-runner]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pnpm
+        if: ${{ inputs.package-manager == 'pnpm' }}
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ inputs.pnpm-version }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: ${{ inputs.package-manager }}
+      - name: Install dependencies
+        run: |
+          if [ "${{ inputs.package-manager }}" = "pnpm" ]; then
+            pnpm install --frozen-lockfile
+          else
+            npm ci
+          fi
+
+      - name: Install Playwright browsers
+        run: |
+          if jq -e '.scripts."${{ inputs.playwright-script }}"' package.json >/dev/null 2>&1; then
+            ${{ inputs.package-manager }} dlx playwright install --with-deps chromium
+          fi
+        shell: bash
+
+      - name: Playwright E2E
+        run: |
+          if jq -e '.scripts."${{ inputs.playwright-script }}"' package.json >/dev/null 2>&1; then
+            ${{ inputs.package-manager }} run ${{ inputs.playwright-script }}
+          else
+            echo "::warning::no '${{ inputs.playwright-script }}' script in package.json — skipping E2E"
+          fi
+        shell: bash
+
+      - name: Build (production)
+        run: |
+          if jq -e '.scripts.build' package.json >/dev/null 2>&1; then
+            ${{ inputs.package-manager }} run build
+          fi
+        shell: bash
+
+  lighthouse:
+    runs-on: [self-hosted, linux, arm64, wentzel-runner]
+    timeout-minutes: 15
+    needs: e2e
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pnpm
+        if: ${{ inputs.package-manager == 'pnpm' }}
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ inputs.pnpm-version }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: ${{ inputs.package-manager }}
+      - name: Install
+        run: |
+          if [ "${{ inputs.package-manager }}" = "pnpm" ]; then
+            pnpm install --frozen-lockfile
+          else
+            npm ci
+          fi
+
+      - name: Lighthouse
+        run: |
+          if jq -e '.scripts."${{ inputs.lighthouse-script }}"' package.json >/dev/null 2>&1; then
+            ${{ inputs.package-manager }} run ${{ inputs.lighthouse-script }}
+          else
+            echo "::warning::no '${{ inputs.lighthouse-script }}' script — skipping Lighthouse"
+          fi
+        shell: bash
+
+  deploy:
+    if: ${{ inputs.run-deploy }}
+    runs-on: [self-hosted, linux, arm64, wentzel-runner]
+    timeout-minutes: 30
+    needs: [e2e, lighthouse]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pnpm
+        if: ${{ inputs.package-manager == 'pnpm' }}
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ inputs.pnpm-version }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: ${{ inputs.package-manager }}
+      - name: Install
+        run: |
+          if [ "${{ inputs.package-manager }}" = "pnpm" ]; then
+            pnpm install --frozen-lockfile
+          else
+            npm ci
+          fi
+      - name: Deploy
+        run: |
+          if jq -e '.scripts.deploy' package.json >/dev/null 2>&1; then
+            ${{ inputs.package-manager }} run deploy
+          else
+            echo "::warning::run-deploy=true but no 'deploy' script — noop"
+          fi
+        shell: bash
