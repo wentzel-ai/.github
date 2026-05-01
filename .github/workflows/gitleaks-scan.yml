@@ -1,0 +1,96 @@
+# Reusable gitleaks scan — call from any wentzel-ai repo with:
+#
+#   jobs:
+#     gitleaks:
+#       uses: wentzel-ai/.github/.github/workflows/gitleaks-scan.yml@main
+#
+# Runs the gitleaks scanner against the repo using a pinned arm64
+# binary on the wentzel-runner self-hosted fleet. Free OSS alternative
+# to GitHub's $19/committer/mo Secret Protection SKU (PLAT-42 / Compass
+# sec-secret-scanning criterion).
+#
+# Optional inputs let callers tune:
+#   gitleaks_version  — pin a different release (default 8.21.2)
+#   config_path       — alternate .gitleaks.toml location
+#   redact            — true/false (default true) — mask secret content in logs
+#   fail_on_finding   — true/false (default true) — set false to alert-only
+
+name: gitleaks-scan
+
+on:
+  workflow_call:
+    inputs:
+      gitleaks_version:
+        type: string
+        required: false
+        default: '8.21.2'
+      config_path:
+        type: string
+        required: false
+        default: '.gitleaks.toml'
+      redact:
+        type: boolean
+        required: false
+        default: true
+      fail_on_finding:
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: [self-hosted, linux, arm64, wentzel-runner]
+    timeout-minutes: 5
+    steps:
+      - name: Checkout (full history for accurate scan range)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install gitleaks (arm64)
+        run: |
+          set -euo pipefail
+          VER="${{ inputs.gitleaks_version }}"
+          URL="https://github.com/gitleaks/gitleaks/releases/download/v${VER}/gitleaks_${VER}_linux_arm64.tar.gz"
+          TMPDIR="$(mktemp -d)"
+          cd "$TMPDIR"
+          curl -fsSL "$URL" -o gitleaks.tgz
+          tar xzf gitleaks.tgz
+          sudo mv gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+
+      - name: Resolve config flag
+        id: cfg
+        run: |
+          if [ -f "${{ inputs.config_path }}" ]; then
+            echo "flag=--config=${{ inputs.config_path }}" >> "$GITHUB_OUTPUT"
+            echo "Using repo config: ${{ inputs.config_path }}"
+          else
+            echo "flag=" >> "$GITHUB_OUTPUT"
+            echo "No repo config — falling back to gitleaks defaults"
+          fi
+
+      - name: Scan
+        run: |
+          set -euo pipefail
+          ARGS=()
+          ARGS+=(detect)
+          ARGS+=(--source=.)
+          ARGS+=(--report-format=sarif)
+          ARGS+=(--report-path=gitleaks.sarif)
+          ARGS+=(--exit-code=$([ "${{ inputs.fail_on_finding }}" = "true" ] && echo 1 || echo 0))
+          if [ "${{ inputs.redact }}" = "true" ]; then ARGS+=(--redact); fi
+          if [ -n "${{ steps.cfg.outputs.flag }}" ]; then ARGS+=(${{ steps.cfg.outputs.flag }}); fi
+          gitleaks "${ARGS[@]}"
+
+      - name: Upload SARIF report (so Security tab catches findings)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gitleaks-sarif
+          path: gitleaks.sarif
+          if-no-files-found: ignore
+          retention-days: 30
